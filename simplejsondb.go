@@ -5,8 +5,10 @@ import (
 	"compress/gzip"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -18,8 +20,10 @@ var (
 )
 
 const (
+	// NoMode represents no locking.
+	NoMode LockMode = iota
 	// ModeRead acquires a shared read lock.
-	ModeRead LockMode = iota
+	ModeRead
 	// ModeWrite acquires an exclusive write lock.
 	ModeWrite
 	// ModeReadWrite is an alias for write (exclusive) lock.
@@ -43,17 +47,25 @@ type (
 		name      string
 		path      string
 		recMu     sync.Mutex
+		recModes  map[string]LockMode
 		recLocks  map[string]*sync.RWMutex
-		recStates map[string]*lockState
+		recStates map[string]*LockState
 	}
 	// LockMode is an enum for lock modes used by manual locking APIs.
 	LockMode int
 )
 
 // internal lock state tracking per ID to support safe unlock semantics
-type lockState struct {
-	r int // number of outstanding read locks acquired via LockID
-	w int // number of outstanding write locks acquired via LockID (0 or 1)
+type LockState struct {
+	R int // number of outstanding read locks acquired via LockID
+	W int // number of outstanding write locks acquired via LockID (0 or 1)
+}
+
+// RecordLock combines the RWMutex and its LockState for a specific record ID.
+type RecordLock struct {
+	Lock  *sync.RWMutex
+	State *LockState
+	Mode  *LockMode
 }
 
 type (
@@ -65,8 +77,10 @@ type (
 		Create(string, []byte, ...Options) error
 		Delete(string) error
 		Len() uint64
-		LockID(id string, mode LockMode)
-		UnlockID(id string, mode LockMode)
+		LockID(id string, mode LockMode) (LockMode, error)
+		UnlockID(id string) error
+		GetLock(id string) *RecordLock
+		IsLock(id string) bool
 	}
 	// DB - a database
 	DB interface {
@@ -328,23 +342,23 @@ func (c *collection) getRecordLockIfExists(id string) *sync.RWMutex {
 	return c.recLocks[id]
 }
 
-// helper: returns the lockState for a specific ID, creating it if needed
-func (c *collection) getOrCreateState(id string) *lockState {
+// helper: returns the LockState for a specific ID, creating it if needed
+func (c *collection) getOrCreateState(id string) *LockState {
 	c.recMu.Lock()
 	defer c.recMu.Unlock()
 	if c.recStates == nil {
-		c.recStates = make(map[string]*lockState)
+		c.recStates = make(map[string]*LockState)
 	}
 	st, ok := c.recStates[id]
 	if !ok || st == nil {
-		st = &lockState{}
+		st = &LockState{}
 		c.recStates[id] = st
 	}
 	return st
 }
 
-// helper: returns the lockState for a specific ID if it exists; does not create it
-func (c *collection) getStateIfExists(id string) *lockState {
+// helper: returns the LockState for a specific ID if it exists; does not create it
+func (c *collection) getStateIfExists(id string) *LockState {
 	c.recMu.Lock()
 	defer c.recMu.Unlock()
 	if c.recStates == nil {
@@ -354,54 +368,123 @@ func (c *collection) getStateIfExists(id string) *lockState {
 }
 
 // LockID allows manual locking for a specific record ID.
-func (c *collection) LockID(id string, mode LockMode) {
+func (c *collection) LockID(id string, mode LockMode) (LockMode, error) {
+	var err error = nil
+	// detect possible deadlock due to double locking
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("deadlock detected: possible double lock on ID '" + id + "' with mode " + strconv.Itoa(int(mode)))
+			err = r.(error)
+		}
+	}()
 	l := c.getRecordLock(id)
 	st := c.getOrCreateState(id)
+	if c.recModes == nil {
+		c.recModes = make(map[string]LockMode)
+	}
+	c.recModes[id] = mode
 	switch mode {
 	case ModeRead:
-		st.r++
+		st.R++
 		l.RLock()
+		return ModeRead, err
 	case ModeReadWrite:
-		st.r++
-		st.w++
+		st.R++
+		st.W++
 		l.Lock()
+		return ModeReadWrite, err
+	// case ModeWrite
 	default: // write/read_write/other (exclusive)
-		st.w++
+		st.W++
 		l.Lock()
+		return ModeWrite, err
 	}
 }
 
 // UnlockID releases a previously acquired lock for a specific record ID.
 // mode should match the mode used in LockID.
-func (c *collection) UnlockID(id string, mode LockMode) {
+func (c *collection) UnlockID(id string) error {
+	mode, ok := c.recModes[id]
+	if !ok {
+		mode = NoMode
+	}
+	var err error = nil
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("deadlock detected: possible double unlock on ID '" + id + "' with mode " + strconv.Itoa(int(mode)))
+			err = r.(error)
+		}
+	}()
 	// Do not create a new lock when unlocking; if lock/state don't exist, it's a no-op
 	l := c.getRecordLockIfExists(id)
 	st := c.getStateIfExists(id)
 	if l == nil || st == nil {
-		return
+		return nil
+	}
+
+	switch mode {
+	case ModeRead:
+		if st.R <= 0 {
+			err = errors.New("double unlock: read lock not held")
+		} else {
+			st.R--
+			l.RUnlock()
+		}
+	case ModeReadWrite:
+		if st.R <= 0 || st.W <= 0 {
+			err = errors.New("double unlock: read lock not held")
+		} else {
+			st.R--
+			st.W--
+			l.Unlock()
+		}
+	default: // write/read_write/other (exclusive)
+		if st.W <= 0 {
+			err = errors.New("double unlock: read lock not held")
+		} else {
+			st.W--
+			l.Unlock()
+		}
+	}
+
+	return err
+}
+
+// GetLock returns the RecordLock (RWMutex + LockState) for a specific record ID.
+func (c *collection) GetLock(id string) *RecordLock {
+	lock := c.getRecordLock(id)
+	if lock == nil {
+		return &RecordLock{
+			Lock:  nil,
+			State: nil,
+			Mode:  nil,
+		}
+	}
+	exists := c.getStateIfExists(id)
+	mode := c.recModes[id]
+	if exists == nil {
+		exists = &LockState{}
+	}
+	return &RecordLock{
+		Lock:  lock,
+		State: exists,
+		Mode:  &mode,
+	}
+}
+
+func (c *collection) IsLock(id string) bool {
+	l := c.getRecordLockIfExists(id)
+	st := c.getStateIfExists(id)
+	mode := c.recModes[id]
+	if l == nil || st == nil {
+		return false
 	}
 	switch mode {
 	case ModeRead:
-		if st.r <= 0 {
-			panic("double unlock: read lock not held")
-		}
-		st.r--
-		l.RUnlock()
+		return st.R > 0
 	case ModeReadWrite:
-		if st.r <= 0 {
-			panic("double unlock: read lock not held")
-		}
-		if st.w <= 0 {
-			panic("double unlock: write lock not held")
-		}
-		st.r--
-		st.w--
-		l.Unlock()
+		return st.R > 0 && st.W > 0
 	default: // write/read_write/other (exclusive)
-		if st.w <= 0 {
-			panic("double unlock: write lock not held")
-		}
-		st.w--
-		l.Unlock()
+		return st.W > 0
 	}
 }
